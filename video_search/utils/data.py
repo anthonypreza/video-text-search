@@ -5,6 +5,9 @@ import os
 import glob
 import random
 import subprocess
+import sys
+import shutil
+import importlib.util
 from typing import List, Dict, Optional
 from tqdm import tqdm
 
@@ -98,12 +101,25 @@ def download_youtube_clip(
         end_time: End time in seconds
         verbose: If True, print detailed error messages for debugging
     """
+    # Use the same environment as this Python process; a venv Python alone does
+    # not put its Scripts directory on PATH for subprocesses.
+    if importlib.util.find_spec("yt_dlp") is None:
+        raise RuntimeError("yt-dlp is not installed in the Python environment running this script.")
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError(
+            "FFmpeg executable was not found on PATH. Install FFmpeg, reopen the terminal, "
+            "and check `ffmpeg -version` before retrying. The Python ffmpeg package is not sufficient."
+        )
+
     # Format options to try in order of preference
     format_options = [
-        "best[height<=480][ext=mp4]",  # Best mp4 up to 480p
-        "worst[ext=mp4]",  # Worst quality mp4
-        "best[height<=360]",  # Very low quality, any format
-        "worst",  # Absolute worst quality available
+        # best/worst require BOTH audio and video. The encoder only needs video,
+        # so accept separate video streams as well as combined streams.
+        # Prefer H.264: MP4 may also contain AV1, which some OpenCV builds cannot decode.
+        "bestvideo*[height<=480][ext=mp4][vcodec^=avc1]",
+        "bestvideo*[height<=480][ext=mp4]",
+        "bestvideo*[height<=480]",
+        "bestvideo*",
     ]
 
     last_error = None
@@ -123,7 +139,7 @@ def download_youtube_clip(
             # Download the specific segment using yt-dlp with ffmpeg
             result = subprocess.run(
                 [
-                    "yt-dlp",
+                    sys.executable, "-m", "yt_dlp",
                     "--external-downloader",
                     "ffmpeg",
                     "--external-downloader-args",
@@ -167,11 +183,9 @@ def download_youtube_clip(
             continue
 
     # All formats failed
-    if verbose and last_error:
-        print(f"Failed to download {youtube_url}")
-        print(f"Last error: {last_error[:200]}")  # First 200 chars of error
-    else:
-        print(f"Failed to download {youtube_url} after trying all format options")
+    print(f"Failed to download {youtube_url} after trying all format options")
+    if last_error:
+        print(f"Last error: {last_error.strip()[-1200:]}")
 
     # Clean up any temporary files
     for temp_file in glob.glob(output_path + ".temp.*"):

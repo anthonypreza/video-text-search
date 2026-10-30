@@ -1,0 +1,46 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.coverage
+htmlcov/
+
+# Generated data, models, and experiment artifacts
+/data/
+/datasets/
+/models/
+/runs/
+/checkpoints/
+/outputs/
+*.pt
+*.pth
+*.safetensors
+*.pkl
+*.onnx
+*.onnx.data
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.part
+*.ytdl
+
+# Credentials and machine-local configuration
+.env
+.env.*
+*.pem
+*.key
+cookies.txt
+cookies*.txt
+.DS_Store
+Thumbs.db
+
+# Rust build output
+/api/target/

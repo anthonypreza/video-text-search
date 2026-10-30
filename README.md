@@ -45,8 +45,35 @@ Text Query → BERT → Text Encoder (512-dim)
 
 ## Quick Start
 
+### 0. Install Python dependencies
+
+Use Python 3.12+ and run these commands from the `video-text-search/` directory:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+On Windows PowerShell, activate with `.\.venv\Scripts\Activate.ps1` instead.
+Install the system FFmpeg executable as described below and check `ffmpeg -version`.
+The dependency file pins direct Python dependencies; it is not a complete lockfile.
+PyTorch GPU support depends on your platform and driver setup; CPU execution is supported.
+The first model initialization downloads pretrained ResNet50 and BERT weights.
+
+YouTube changes can require a newer downloader. If extraction stops working, update
+it inside the activated environment:
+
+```bash
+python -m pip install --upgrade "yt-dlp[default]"
+```
+
+For full YouTube support, yt-dlp also recommends a supported JavaScript runtime;
+see its [runtime setup guide](https://github.com/yt-dlp/yt-dlp/wiki/EJS).
+
 ### 1. Training Phase
-Train the model and create the search index (run from video-search/ directory):
+Train the model and create the search index (run from video-text-search/ directory):
 
 ```bash
 # MSR-VTT (recommended)
@@ -118,7 +145,19 @@ class VideoSearchConfig:
 2. **Triplet Creation**: Each video caption becomes a positive query with N negative samples  
 3. **Contrastive Training**: Learns to maximize similarity between videos and their captions
 4. **Model & Index Saving**: Automatically saves trained model and search index
-5. **Evaluation**: Tests retrieval performance with recall@k metrics
+5. **Evaluation**: Runs a small training-data ranking check, described below
+
+### Evaluation scope
+
+After training, the pipeline evaluates the first five training triplets. For each
+video, it ranks that triplet's positive caption against its sampled negative
+captions and reports `accuracy_at_1` and `accuracy_at_3`.
+
+This is a training-data sanity check, not validation or held-out test evaluation.
+It does not measure text-to-video Recall@K across a video collection and should
+not be interpreted as a benchmark of retrieval generalization. The repository
+does not currently provide a held-out evaluation pipeline or verified benchmark
+results.
 
 ### Search Process
 1. **Model Loading**: Loads pre-trained model and video index
@@ -222,7 +261,7 @@ python scripts/pipeline.py \
 
 Tips:
 - Drop `--skip-training` if you want to fine-tune before exporting.
-- The ONNX export will default to opset 18. You can request `--export-onnx-text`
+- The ONNX export uses opset 17. You can request `--export-onnx-text`
   even if you already have a model – the command regenerates `models/text_encoder.onnx`.
 
 ### 2. Push fresh embeddings to Weaviate

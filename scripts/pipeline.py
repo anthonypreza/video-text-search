@@ -1,11 +1,12 @@
-import os
 import argparse
+import hashlib
+import json
+import os
 import sys
 from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
-
 
 # Ensure the project root (containing the `video_search` package) is on sys.path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -14,20 +15,24 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from video_search.core.config import VideoSearchConfig
-from video_search.utils.video import VideoProcessor
 from video_search.core.encoders import TextEncoder
-from video_search.utils.data import (
-    VideoQueryDataset,
-    create_synthetic_dataset,
-    load_msrvtt_dataset,
-)
-from video_search.search.index import build_video_index
 from video_search.core.model import (
     VideoTextContrastiveModel,
-    train_video_search_model,
     evaluate_retrieval,
+    evaluate_text_to_video,
+    train_video_search_model,
 )
+from video_search.search.index import build_video_index
 from video_search.search.search import search_videos_indexed
+from video_search.utils.data import (
+    VideoQueryDataset,
+    VideoQueryTriplet,
+    build_msrvtt_triplets,
+    create_synthetic_dataset,
+    prepare_msrvtt_dataset,
+    split_video_records,
+)
+from video_search.utils.video import VideoProcessor
 
 
 def _ensure_outdir(path: str) -> Path:
@@ -154,6 +159,19 @@ def main(
     onnx_outdir: str = "models",
     export_tokenizer: bool = False,
     tokenizer_outdir: str = "models",
+    prepare_only: bool = False,
+    cached_only: bool = False,
+    download_workers: int = 3,
+    retry_failures: bool = False,
+    data_dir: str = "./data/msrvtt",
+    prepared_manifest: str | None = None,
+    seed: int = 42,
+    device: str = "auto",
+    epochs: int = 10,
+    batch_size: int = 16,
+    checkpoint_path: str | None = None,
+    resume: str | None = None,
+    test_fraction: float = 0.1,
 ):
     """Main function for training video search pipeline
 
@@ -164,17 +182,65 @@ def main(
     """
 
     # Initialize configuration
-    config = VideoSearchConfig()
+    config = VideoSearchConfig(device=device)
+    if epochs < 1 or batch_size < 1:
+        raise ValueError("--epochs and --batch-size must be positive")
+    if resume and (skip_training or prepare_only):
+        raise ValueError("--resume requires training")
+    if not 0 <= test_fraction < 1:
+        raise ValueError("--test-fraction must be at least 0 and less than 1")
+    config.num_epochs = epochs
+    config.batch_size = batch_size
+    checkpoint_path = checkpoint_path or resume or "checkpoints/last.pt"
+    if not skip_training and not prepare_only:
+        if resume and not Path(resume).is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {resume}")
+        if not resume and Path(checkpoint_path).exists():
+            raise FileExistsError(
+                f"Checkpoint already exists: {checkpoint_path}; use --resume or a new --checkpoint"
+            )
     print(f"Configuration: {vars(config)}")
     print()
 
-    # Create dataset
-    if use_msrvtt:
-        triplets = load_msrvtt_dataset(
-            data_dir="./data/msrvtt",
-            max_videos=max_videos,
-            num_negatives=config.num_negatives,
+    if (prepare_only or cached_only) and not use_msrvtt:
+        raise ValueError("--prepare-only and --cached-only require --dataset msrvtt")
+    if prepare_only:
+        prepare_msrvtt_dataset(
+            data_dir,
+            max_videos,
+            download_workers=download_workers,
+            retry_failures=retry_failures,
+            manifest_path=prepared_manifest,
         )
+        print("Preparation complete; use --cached-only to train without downloads.")
+        return
+
+    # Split source videos before captions can be sampled as training negatives.
+    test_triplets: list[VideoQueryTriplet] = []
+    if use_msrvtt:
+        records = prepare_msrvtt_dataset(
+            data_dir=data_dir,
+            max_videos=max_videos,
+            download_workers=download_workers,
+            retry_failures=retry_failures,
+            cached_only=cached_only,
+            manifest_path=prepared_manifest,
+        )
+        if test_fraction and not skip_training:
+            records, test_records = split_video_records(records, test_fraction, seed)
+            test_triplets = [
+                VideoQueryTriplet(
+                    str(Path(data_dir) / "videos" / f"{record['video_id']}.mp4"),
+                    caption,
+                    [],
+                )
+                for record in test_records
+                for caption in record["captions"]
+            ]
+            print(
+                f"Split (seed {seed}): {len(records)} training clips, {len(test_records)} held-out test clips"
+            )
+        triplets = build_msrvtt_triplets(records, data_dir, config.num_negatives, seed)
         dataset_name = "MSR-VTT"
     else:
         print("Creating synthetic dataset...")
@@ -260,26 +326,33 @@ def main(
     else:
         # Train the model
         print("Starting training...")
-        train_losses = train_video_search_model(model, dataloader, config)
+        signature = hashlib.sha256()
+        for triplet in triplets:
+            path = Path(triplet.video_path)
+            stat = path.stat()
+            signature.update(
+                json.dumps(
+                    [
+                        path.name,
+                        stat.st_size,
+                        stat.st_mtime_ns,
+                        triplet.positive_query,
+                        triplet.negative_queries,
+                    ],
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            )
+        train_losses = train_video_search_model(
+            model,
+            dataloader,
+            config,
+            checkpoint_path=checkpoint_path,
+            resume=resume,
+            dataset_signature=signature.hexdigest(),
+        )
 
         print("Training completed!")
         print(f"Final loss: {train_losses[-1]:.4f}")
-        print()
-
-        # Evaluate the model
-        print("Evaluating model...")
-        test_triplets = triplets[:5]  # Use first 5 triplets as test set
-
-        eval_metrics = evaluate_retrieval(
-            model=model, test_triplets=test_triplets, device=config.device, top_k=3
-        )
-
-        print("Evaluation Results:")
-        for metric, value in eval_metrics.items():
-            if isinstance(value, float):
-                print(f"  {metric}: {value:.3f}")
-            else:
-                print(f"  {metric}: {value}")
         print()
 
         # Save trained model
@@ -294,10 +367,38 @@ def main(
                 "model_state_dict": model.state_dict(),
                 "config": config,
                 "dataset_name": dataset_name,
+                "evaluation_split": {
+                    "seed": seed,
+                    "test_fraction": test_fraction if test_triplets else 0,
+                    "train_videos": sorted(
+                        {Path(item.video_path).name for item in triplets}
+                    ),
+                    "test_videos": sorted(
+                        {Path(item.video_path).name for item in test_triplets}
+                    ),
+                },
             },
             config.model_save_path,
         )
         print(f"Model saved to {config.model_save_path}")
+
+        if test_triplets:
+            print("Final held-out text-to-video evaluation...")
+            eval_metrics = evaluate_text_to_video(
+                model, test_triplets, device=config.device, batch_size=config.batch_size
+            )
+            print("Held-out test results (recall is a fraction from 0 to 1):")
+        else:
+            print("Training-sample ranking sanity check (not held-out evaluation)...")
+            eval_metrics = evaluate_retrieval(
+                model=model, test_triplets=triplets[:5], device=config.device, top_k=3
+            )
+        for metric, value in eval_metrics.items():
+            if isinstance(value, float):
+                print(f"  {metric}: {value:.3f}")
+            else:
+                print(f"  {metric}: {value}")
+        print()
 
     # Get all video paths
     video_paths = list(set(triplet.video_path for triplet in triplets))
@@ -313,6 +414,7 @@ def main(
     video_index = build_video_index(
         model=model,
         video_paths=video_paths,
+        device=config.device,
     )
 
     # Save video index
@@ -411,6 +513,67 @@ if __name__ == "__main__":
         default="models",
         help="Directory to write tokenizer files (default: models)",
     )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="Prepare validated MSR-VTT clips and a manifest without loading a model",
+    )
+    mode.add_argument(
+        "--cached-only",
+        action="store_true",
+        help="Train from the prepared manifest without metadata or video downloads",
+    )
+    parser.add_argument(
+        "--download-workers",
+        type=int,
+        default=3,
+        help="Concurrent downloads (1-8; default: 3)",
+    )
+    parser.add_argument(
+        "--retry-failures", action="store_true", help="Retry cached download failures"
+    )
+    parser.add_argument(
+        "--data-dir", default="./data/msrvtt", help="MSR-VTT cache directory"
+    )
+    parser.add_argument(
+        "--prepared-manifest",
+        default=None,
+        help="Prepared manifest path (default: DATA_DIR/prepared.json)",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Video-split and negative-sampling seed"
+    )
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="Training device; auto selects GPU when available (AMD uses cuda too)",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=10,
+        help="Total epochs, including completed epochs when resuming",
+    )
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Epoch checkpoint destination (default: checkpoints/last.pt, or the resume path)",
+    )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        metavar="PATH",
+        help="Resume a trusted training checkpoint at the next epoch",
+    )
+    parser.add_argument(
+        "--test-fraction",
+        type=float,
+        default=0.1,
+        help="Fraction of MSR-VTT source videos held out for a final test (default: 0.1; 0 disables it)",
+    )
     args = parser.parse_args()
 
     use_msrvtt = args.dataset == "msrvtt"
@@ -423,4 +586,17 @@ if __name__ == "__main__":
         onnx_outdir=args.onnx_outdir,
         export_tokenizer=args.export_tokenizer,
         tokenizer_outdir=args.tokenizer_outdir,
+        prepare_only=args.prepare_only,
+        cached_only=args.cached_only,
+        download_workers=args.download_workers,
+        retry_failures=args.retry_failures,
+        data_dir=args.data_dir,
+        prepared_manifest=args.prepared_manifest,
+        seed=args.seed,
+        device=args.device,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        checkpoint_path=args.checkpoint,
+        resume=args.resume,
+        test_fraction=args.test_fraction,
     )

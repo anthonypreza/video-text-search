@@ -13,18 +13,43 @@ Env vars (optional):
   WEAVIATE_API_KEY (if auth enabled)
 """
 
-import os
-import json
 import argparse
-from typing import List, Optional
+import json
+import os
+from typing import TypedDict, cast
 
 import numpy as np
-import requests
 import onnxruntime as ort
-from transformers import AutoTokenizer
+import requests
+from numpy.typing import NDArray
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 
-def l2_normalize(v: np.ndarray, axis: int = -1, eps: float = 1e-12) -> np.ndarray:
+class RetrievalMetadata(TypedDict, total=False):
+    distance: float | None
+    score: float | None
+
+
+class RetrievalHit(TypedDict, total=False):
+    video_id: str
+    title: str
+    url: str
+    start_s: float
+    end_s: float
+    _additional: RetrievalMetadata
+
+
+class RetrievalData(TypedDict):
+    Get: dict[str, list[RetrievalHit]]
+
+
+class RetrievalResponse(TypedDict, total=False):
+    data: RetrievalData
+
+
+def l2_normalize(
+    v: NDArray[np.float32], axis: int = -1, eps: float = 1e-12
+) -> NDArray[np.float32]:
     n = np.linalg.norm(v, axis=axis, keepdims=True)
     return v / (n + eps)
 
@@ -37,10 +62,10 @@ def load_onnx_session(model_path: str) -> ort.InferenceSession:
 
 def embed_text(
     sess: ort.InferenceSession,
-    tokenizer: AutoTokenizer,
+    tokenizer: PreTrainedTokenizerBase,
     text: str,
     max_length: int = 128,
-) -> np.ndarray:
+) -> NDArray[np.float32]:
     """Returns (1, D) float32 embedding (L2-normalized)."""
     enc = tokenizer(
         [text],
@@ -51,25 +76,27 @@ def embed_text(
     )
     # ONNX inputs must match names used at export
     inputs = {
-        "input_ids": enc["input_ids"].astype(np.int64),
-        "attention_mask": enc["attention_mask"].astype(np.int64),
+        "input_ids": cast(NDArray[np.int64], enc["input_ids"]).astype(np.int64),
+        "attention_mask": cast(NDArray[np.int64], enc["attention_mask"]).astype(
+            np.int64
+        ),
     }
     # Export names text output as "text_embedding"
     (emb,) = sess.run(["text_embedding"], inputs)  # (1, D) float32
     # Your model already normalizes, but re-normalize defensively (idempotent)
-    emb = l2_normalize(emb, axis=1)
+    emb = l2_normalize(cast(NDArray[np.float32], emb), axis=1)
     return emb.astype(np.float32)
 
 
 def weaviate_near_vector(
     weaviate_url: str,
     class_name: str,
-    vector: np.ndarray,
+    vector: NDArray[np.float32],
     top_k: int = 10,
-    ef: Optional[int] = None,
-    channel_filter: Optional[str] = None,
-    api_key: Optional[str] = None,
-) -> dict:
+    ef: int | None = None,
+    channel_filter: str | None = None,
+    api_key: str | None = None,
+) -> RetrievalResponse:
     """Calls Weaviate GraphQL nearVector and returns JSON."""
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -109,12 +136,16 @@ def weaviate_near_vector(
         f"{weaviate_url}/v1/graphql", headers=headers, json=payload, timeout=60
     )
     resp.raise_for_status()
-    return resp.json()
+    return cast(RetrievalResponse, resp.json())
 
 
-def print_results(data: dict, class_name: str, query: str, fmt: str):
+def print_results(data: RetrievalResponse, class_name: str, query: str, fmt: str):
+    payload = data.get("data")
+    if payload is None:
+        print(json.dumps(data, indent=2))
+        return
     try:
-        hits = data["data"]["Get"][class_name]
+        hits = payload["Get"][class_name]
     except Exception:
         print(json.dumps(data, indent=2))
         return

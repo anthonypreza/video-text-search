@@ -5,14 +5,12 @@ Command Line Video Search
 Search videos using a single query from the command line.
 """
 
+import argparse
 import os
 import pickle
-import torch
-import argparse
-from typing import List, Tuple
-
 import sys
-import os
+
+import torch
 
 # Ensure the project root (containing the `video_search` package) is on sys.path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -22,12 +20,13 @@ if PROJECT_ROOT not in sys.path:
 
 from video_search.core.config import VideoSearchConfig
 from video_search.core.model import VideoTextContrastiveModel
+from video_search.search.index import VideoIndex
 from video_search.search.search import search_videos_indexed
 
 
 def load_model_and_index(
     config: VideoSearchConfig,
-) -> Tuple[VideoTextContrastiveModel, dict]:
+) -> tuple[VideoTextContrastiveModel, VideoIndex]:
     """Load trained model and video index from saved files"""
 
     # Load model
@@ -38,7 +37,7 @@ def load_model_and_index(
         from video_search.core.config import VideoSearchConfig as _VSC
 
         legacy_cfg_mod = types.ModuleType("config")
-        legacy_cfg_mod.VideoSearchConfig = _VSC  # type: ignore
+        setattr(legacy_cfg_mod, "VideoSearchConfig", _VSC)
         sys.modules.setdefault("config", legacy_cfg_mod)
     except Exception:
         pass
@@ -65,7 +64,7 @@ def load_model_and_index(
 
 def search_videos_cli(
     query: str, top_k: int = 5, verbose: bool = True
-) -> List[Tuple[str, float]]:
+) -> list[tuple[str, float]]:
     """Search videos using command line query"""
 
     config = VideoSearchConfig()

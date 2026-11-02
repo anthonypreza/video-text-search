@@ -1,0 +1,18 @@
+# Python 3.12, Ubuntu 24.04 WSL, installed ROCm 6.4.2 runtime.
+# AMD's WSL-tested wheels; separate from the default CUDA/CPU requirements.
+https://repo.radeon.com/rocm/manylinux/rocm-rel-6.4.2/torch-2.6.0%2Brocm6.4.2.git76481f7c-cp312-cp312-linux_x86_64.whl
+https://repo.radeon.com/rocm/manylinux/rocm-rel-6.4.2/torchvision-0.21.0%2Brocm6.4.2.git4040d51f-cp312-cp312-linux_x86_64.whl
+https://repo.radeon.com/rocm/manylinux/rocm-rel-6.4.2/pytorch_triton_rocm-3.2.0%2Brocm6.4.2.git7e948ebf-cp312-cp312-linux_x86_64.whl
+# ROCm 6.4.2 wheels require NumPy 1.x; OpenCV 4.11 supports that ABI.
+numpy==1.26.4
+pyarrow==21.0.0
+opencv-python==4.11.0.86
+transformers==4.57.1
+datasets==4.2.0
+Pillow==12.0.0
+tqdm==4.67.1
+requests==2.34.2
+onnx==1.19.1
+onnxscript==0.5.3
+onnxruntime==1.23.1
+yt-dlp[default]==2026.10.26

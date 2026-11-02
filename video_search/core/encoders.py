@@ -1,11 +1,18 @@
+import sys
+from contextlib import nullcontext
+from typing import cast
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-
-from torchvision.models import resnet50, ResNet50_Weights
-
-from typing import List, Dict
-from transformers import AutoTokenizer, AutoModel
+from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torchvision.models import ResNet50_Weights, resnet50
+from transformers import (
+    AutoModel,
+    AutoTokenizer,
+    BatchEncoding,
+    PreTrainedTokenizerBase,
+)
 
 
 class TextEncoder(nn.Module):
@@ -21,7 +28,9 @@ class TextEncoder(nn.Module):
         super().__init__()
 
         self.max_length = max_length
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
+            model_name
+        )
         self.bert = AutoModel.from_pretrained(model_name)
 
         if freeze_bert:
@@ -34,7 +43,7 @@ class TextEncoder(nn.Module):
             nn.Dropout(0.1),
         )
 
-    def encode_text(self, texts: List[str]) -> Dict[str, torch.Tensor]:
+    def encode_text(self, texts: list[str]) -> BatchEncoding:
         """Tokenize and encode a list of texts"""
         encoding = self.tokenizer(
             texts,
@@ -49,7 +58,17 @@ class TextEncoder(nn.Module):
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
     ) -> torch.Tensor:
         """Forward pass through BERT and projection layer"""
-        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        # Windows ROCm 7.14.1 fused attention can break later GPU kernels.
+        # Keep the same attention calculation using PyTorch's math backend.
+        attention_context = (
+            sdpa_kernel(SDPBackend.MATH)
+            if sys.platform == "win32"
+            and torch.version.hip is not None
+            and input_ids.device.type == "cuda"
+            else nullcontext()
+        )
+        with attention_context:
+            outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
 
         # Use [CLS] token embedding
         cls_embedding = outputs.last_hidden_state[:, 0]
@@ -62,10 +81,13 @@ class TextEncoder(nn.Module):
 
         return text_embedding
 
-    def encode_queries(self, queries: List[str]) -> torch.Tensor:
+    def encode_queries(self, queries: list[str]) -> torch.Tensor:
         """Convenience method to encode queries end-to-end"""
-        encoding = self.encode_text(queries)
-        return self.forward(encoding["input_ids"], encoding["attention_mask"])
+        encoding = self.encode_text(queries).to(next(self.bert.parameters()).device)
+        return self.forward(
+            cast(torch.Tensor, encoding["input_ids"]),
+            cast(torch.Tensor, encoding["attention_mask"]),
+        )
 
 
 class VideoEncoder(nn.Module):

@@ -1,18 +1,18 @@
+import numpy as np
 import torch
 import tqdm
-import numpy as np
 
 from ..core.model import VideoTextContrastiveModel
-from typing import Any, Dict, List, Tuple
+from .index import VideoIndex
 
 
 def search_videos(
     model: VideoTextContrastiveModel,
     query: str,
-    video_paths: List[str],
+    video_paths: list[str],
     device: str = "cpu",
     top_k: int = 5,
-) -> List[Tuple[str, float]]:
+) -> list[tuple[str, float]]:
     """
     Search for videos using a text query
 
@@ -36,7 +36,7 @@ def search_videos(
     similarities = []
 
     with torch.no_grad():
-        for video_path in tqdm(video_paths, desc=f"Searching for '{query}'"):  # type: ignore
+        for video_path in tqdm.tqdm(video_paths, desc=f"Searching for '{query}'"):
             try:
                 # Encode video
                 video_frames = model.video_processor.extract_frames(video_path)
@@ -60,8 +60,11 @@ def search_videos(
 
 
 def search_videos_indexed(
-    model: VideoTextContrastiveModel, query: str, video_index: Dict[str, Any], top_k=5
-):
+    model: VideoTextContrastiveModel,
+    query: str,
+    video_index: VideoIndex,
+    top_k: int = 5,
+) -> list[tuple[str, float]]:
     """Fast search using pre-computed video embeddings"""
 
     # Compute query embedding

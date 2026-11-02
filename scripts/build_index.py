@@ -5,11 +5,12 @@ Build Video Index from Trained Model
 Create a video search index from an already trained model without retraining.
 """
 
+import argparse
 import os
 import pickle
-import torch
-import argparse
 import sys
+
+import torch
 
 # Ensure the project root (containing the `video_search` package) is on sys.path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -19,8 +20,8 @@ if PROJECT_ROOT not in sys.path:
 
 from video_search.core.config import VideoSearchConfig
 from video_search.core.model import VideoTextContrastiveModel
-from video_search.utils.data import load_msrvtt_dataset, create_synthetic_dataset
 from video_search.search.index import build_video_index
+from video_search.utils.data import create_synthetic_dataset, load_msrvtt_dataset
 
 
 def load_trained_model(config: VideoSearchConfig) -> VideoTextContrastiveModel:

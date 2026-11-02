@@ -12,17 +12,21 @@ The model learns to maximize similarity between videos and relevant queries whil
 minimizing similarity with irrelevant queries.
 """
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
+import os
+import random
+import tempfile
+from pathlib import Path
 
-from typing import List, Tuple, Dict
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.utils.data import DataLoader
 from tqdm import tqdm
-from .config import VideoSearchConfig
-from ..utils.data import VideoQueryTriplet
-from .encoders import TextEncoder, VideoEncoder
+
+from ..utils.data import VideoQuerySample, VideoQueryTriplet
 from ..utils.video import VideoProcessor
+from .config import VideoSearchConfig
+from .encoders import TextEncoder, VideoEncoder
 
 
 class VideoTextContrastiveModel(nn.Module):
@@ -48,11 +52,11 @@ class VideoTextContrastiveModel(nn.Module):
     def encode_video(self, video_path: str) -> torch.Tensor:
         """Encode a single video to embedding"""
         frames = self.video_processor.extract_frames(video_path)
-        frames = frames.unsqueeze(0)  # Add batch dimension
+        frames = frames.unsqueeze(0).to(next(self.video_encoder.parameters()).device)
         video_embedding = self.video_encoder(frames)
         return video_embedding.squeeze(0)  # Remove batch dimension
 
-    def encode_texts(self, texts: List[str]) -> torch.Tensor:
+    def encode_texts(self, texts: list[str]) -> torch.Tensor:
         """Encode a list of texts to embeddings"""
         return self.text_encoder.encode_queries(texts)
 
@@ -108,7 +112,7 @@ class VideoTextContrastiveModel(nn.Module):
         text_input_ids: torch.Tensor,
         text_attention_mask: torch.Tensor,
         target_indices: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for training
         Args:
@@ -146,8 +150,14 @@ class VideoTextContrastiveModel(nn.Module):
 
 
 def train_video_search_model(
-    model: VideoTextContrastiveModel, dataloader: DataLoader, config: VideoSearchConfig
-) -> List[float]:
+    model: VideoTextContrastiveModel,
+    dataloader: DataLoader[VideoQuerySample],
+    config: VideoSearchConfig,
+    *,
+    checkpoint_path: str | None = None,
+    resume: str | None = None,
+    dataset_signature: str | None = None,
+) -> list[float]:
     """
     Train the video search model
 
@@ -159,6 +169,15 @@ def train_video_search_model(
     Returns:
         List of losses per epoch
     """
+
+    if config.num_epochs < 1 or len(dataloader) == 0:
+        raise ValueError("Training requires positive epochs and a nonempty dataloader")
+    selected_path = checkpoint_path or resume
+    destination = Path(selected_path) if selected_path is not None else None
+    if destination is not None and destination.exists() and resume is None:
+        raise FileExistsError(
+            f"Checkpoint already exists: {destination}; use --resume or a new --checkpoint"
+        )
 
     # Move model to device
     model.to(config.device)
@@ -175,11 +194,51 @@ def train_video_search_model(
 
     # Track training progress
     epoch_losses = []
+    start_epoch = 0
+    settings = {
+        key: value
+        for key, value in vars(config).items()
+        if key
+        not in {
+            "num_epochs",
+            "device",
+            "model_save_path",
+            "index_save_path",
+            "video_paths_save_path",
+        }
+    }
+    if resume is not None:
+        # Only load checkpoints you created or otherwise trust.
+        checkpoint = torch.load(resume, map_location="cpu", weights_only=True)
+        if checkpoint.get("format_version") != 1:
+            raise ValueError("Not a resumable training checkpoint")
+        if (
+            checkpoint["settings"] != settings
+            or checkpoint["dataset_signature"] != dataset_signature
+        ):
+            raise ValueError(
+                "Checkpoint dataset or training settings do not match this run"
+            )
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        epoch_losses = checkpoint["epoch_losses"]
+        start_epoch = checkpoint["completed_epochs"]
+        if config.num_epochs < start_epoch:
+            raise ValueError(
+                "--epochs must be at least the checkpoint's completed epoch count"
+            )
+        random.setstate(checkpoint["python_rng_state"])
+        torch.set_rng_state(checkpoint["torch_rng_state"])
+        if config.device == "cuda" and checkpoint["cuda_rng_states"] is not None:
+            torch.cuda.set_rng_state_all(checkpoint["cuda_rng_states"])
+        print(
+            f"Resuming after epoch {start_epoch}; target: {config.num_epochs} total epochs"
+        )
 
     print(f"Training on device: {config.device}")
     print(f"Training for {config.num_epochs} epochs...")
 
-    for epoch in range(config.num_epochs):
+    for epoch in range(start_epoch, config.num_epochs):
         total_loss = 0.0
         correct_predictions = 0
         total_predictions = 0
@@ -228,6 +287,43 @@ def train_video_search_model(
         epoch_accuracy = correct_predictions / total_predictions
         epoch_losses.append(avg_epoch_loss)
 
+        if destination is not None:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            # Write beside the destination so replacement is atomic on one filesystem.
+            temporary_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    dir=destination.parent,
+                    prefix=destination.name + ".",
+                    suffix=".tmp",
+                    delete=False,
+                ) as stream:
+                    temporary_path = Path(stream.name)
+                    torch.save(
+                        {
+                            "format_version": 1,
+                            "model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "completed_epochs": epoch + 1,
+                            "epoch_losses": epoch_losses,
+                            "settings": settings,
+                            "dataset_signature": dataset_signature,
+                            "python_rng_state": random.getstate(),
+                            "torch_rng_state": torch.get_rng_state(),
+                            "cuda_rng_states": torch.cuda.get_rng_state_all()
+                            if config.device == "cuda"
+                            else None,
+                        },
+                        stream,
+                    )
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary_path, destination)
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+            print(f"Checkpoint saved after epoch {epoch + 1}: {destination}")
+
         print(f"Epoch {epoch + 1}/{config.num_epochs}:")
         print(f"  Average Loss: {avg_epoch_loss:.4f}")
         print(f"  Accuracy: {epoch_accuracy:.3f}")
@@ -239,10 +335,10 @@ def train_video_search_model(
 
 def evaluate_retrieval(
     model: VideoTextContrastiveModel,
-    test_triplets: List[VideoQueryTriplet],
+    test_triplets: list[VideoQueryTriplet],
     device: str = "cpu",
     top_k: int = 5,
-) -> Dict[str, float]:
+) -> dict[str, float | int]:
     """
     Evaluate video-text retrieval performance
 

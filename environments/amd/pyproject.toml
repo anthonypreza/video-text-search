@@ -1,0 +1,107 @@
+[project]
+name = "video-text-search-amd-environment"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "amd-torchvision-device-gfx1100",
+    "rocm",
+    "rocm-bootstrap",
+    "rocm-sdk-core",
+    "rocm-sdk-device-gfx1100",
+    "rocm-sdk-libraries",
+    "amd-torch-device-gfx1100",
+    "amd-torch-device-gfx110x",
+    "transformers==4.57.1",
+    "datasets==4.2.0",
+    "numpy==2.1.3",
+    "Pillow==12.0.0",
+    "opencv-python==4.12.0.88",
+    "tqdm==4.67.1",
+    "requests==2.34.2",
+    "onnx==1.19.1",
+    "onnxscript==0.5.3",
+    "onnxruntime==1.23.1",
+    "yt-dlp[default]==2026.10.26",
+    "torch[device-gfx1100]==2.12.0+rocm7.14.1",
+    "torchvision[device-gfx1100]==0.27.0+rocm7.14.1",
+    "pyarrow==21.0.0",
+]
+
+[tool.uv]
+package = false
+environments = ["sys_platform == 'win32' and platform_machine == 'AMD64'"]
+
+[tool.uv.sources]
+torch = { url = "https://repo.amd.com/rocm/whl-multi-arch/torch-2.12.0%2Brocm7.14.1-cp312-cp312-win_amd64.whl" }
+torchvision = { url = "https://repo.amd.com/rocm/whl-multi-arch/torchvision-0.27.0%2Brocm7.14.1-cp312-cp312-win_amd64.whl" }
+
+[[tool.uv.index]]
+name = "amd-rocm"
+url = "https://repo.amd.com/rocm/whl-multi-arch/"
+ignore-error-codes = [403]
+explicit = true
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[tool.uv.sources.transformers]
+index = "pypi"
+
+[tool.uv.sources.datasets]
+index = "pypi"
+
+[tool.uv.sources.numpy]
+index = "pypi"
+
+[tool.uv.sources.Pillow]
+index = "pypi"
+
+[tool.uv.sources.opencv-python]
+index = "pypi"
+
+[tool.uv.sources.tqdm]
+index = "pypi"
+
+[tool.uv.sources.requests]
+index = "pypi"
+
+[tool.uv.sources.onnx]
+index = "pypi"
+
+[tool.uv.sources.onnxscript]
+index = "pypi"
+
+[tool.uv.sources.onnxruntime]
+index = "pypi"
+
+[tool.uv.sources.yt-dlp]
+index = "pypi"
+
+[tool.uv.sources.pyarrow]
+index = "pypi"
+
+[tool.uv.sources.amd-torch-device-gfx1100]
+index = "amd-rocm"
+
+[tool.uv.sources.amd-torch-device-gfx110x]
+index = "amd-rocm"
+
+[tool.uv.sources.amd-torchvision-device-gfx1100]
+index = "amd-rocm"
+
+[tool.uv.sources.rocm]
+index = "amd-rocm"
+
+[tool.uv.sources.rocm-bootstrap]
+index = "amd-rocm"
+
+[tool.uv.sources.rocm-sdk-core]
+index = "amd-rocm"
+
+[tool.uv.sources.rocm-sdk-device-gfx1100]
+index = "amd-rocm"
+
+[tool.uv.sources.rocm-sdk-libraries]
+index = "amd-rocm"

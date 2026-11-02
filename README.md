@@ -72,6 +72,31 @@ python -m pip install --upgrade "yt-dlp[default]"
 For full YouTube support, yt-dlp also recommends a supported JavaScript runtime;
 see its [runtime setup guide](https://github.com/yt-dlp/yt-dlp/wiki/EJS).
 
+### AMD GPU training on WSL
+
+For Ubuntu 24.04, Python 3.12, and an installed ROCm 6.4.2 WSL runtime:
+
+```bash
+./scripts/setup-wsl-gpu.sh
+./scripts/run-wsl-gpu.sh -c 'import torch; print(torch.cuda.get_device_name(0))'
+./scripts/run-wsl-gpu.sh scripts/pipeline.py --dataset msrvtt --max-videos 1000
+```
+
+This uses an isolated `.venv-wsl-gpu` environment with AMD's matching PyTorch
+and Torchvision wheels. PyTorch uses the `cuda` device name for AMD HIP too.
+The launcher sets the WSL runtime library paths. The environment supports both CPU and GPU execution.
+The setup preserves the wheel's bundled HSA libraries inside the environment
+and uses the system's WSL-compatible HSA runtime instead, following
+[AMD's ROCm 6.4.2 WSL instructions](https://rocm.docs.amd.com/projects/radeon-ryzen/en/docs-6.4.2/docs/install/wsl/install-pytorch.html).
+
+Do not install the default `requirements.txt` into this GPU environment: it
+selects a different PyTorch build and NumPy version. Existing environments are
+unaffected. The pipeline still uses the parameters in `video_search/core/config.py`
+and writes its model and index to the configured paths. Back up prior outputs
+before rerunning if you want to retain them. Download failures can reduce the
+number of usable videos below the requested maximum. Evaluation remains the
+training-data sanity check described below.
+
 ### 1. Training Phase
 Train the model and create the search index (run from video-text-search/ directory):
 
@@ -87,6 +112,90 @@ This creates:
 - `./models/video_search_model.pth` - Trained model
 - `./models/video_index.pkl` - Pre-computed video embeddings cache
 - `./models/video_paths.txt` - Video file paths
+
+### Choose the training device
+
+Use `--device auto` (the default), `--device cuda`, or `--device cpu`.
+`auto` selects an available GPU, otherwise CPU. `cuda` also names AMD HIP
+devices and raises an error if no GPU is available; it does not silently fall
+back to CPU. The same WSL ROCm environment runs either mode:
+
+```bash
+./scripts/run-wsl-gpu.sh scripts/pipeline.py --dataset msrvtt --max-videos 1000 --cached-only --device cuda
+./scripts/run-wsl-gpu.sh scripts/pipeline.py --dataset msrvtt --max-videos 1000 --cached-only --device cpu
+```
+
+Frame extraction decodes sequentially and samples across the actual frame
+count, avoiding repeated random seeks through stream-copied H.264 clips.
+Decoded frame counts are cached in memory and invalidated when the file changes.
+Undecodable inputs raise an error rather than silently becoming blank videos.
+
+### Prepare once, then train from the cache
+
+Downloading and clipping are separate from triplet construction. Preparation
+uses three concurrent workers by default (configurable from one to eight),
+validates decoded frames, and saves a manifest of usable videos. The requested
+maximum counts successful videos; unavailable source clips are skipped.
+
+```bash
+# CPU preparation; no model weights are loaded.
+.venv-wsl-gpu/bin/python scripts/pipeline.py --dataset msrvtt --max-videos 1000 --prepare-only --download-workers 3
+
+# Train from that manifest without metadata or video download requests.
+./scripts/run-wsl-gpu.sh scripts/pipeline.py --dataset msrvtt --max-videos 1000 --cached-only
+```
+
+For another environment, replace `.venv-wsl-gpu/bin/python` with its Python.
+FFmpeg must be on PATH for preparation. The default one-command training flow
+still prepares clips automatically. Use `--data-dir` to choose the cache and
+`--prepared-manifest` to name a particular manifest. Cached-only mode checks
+file size and modification time against the validated manifest and rejects
+missing or changed clips; it does not prevent the initial pretrained-model
+download if those weights are not already cached.
+
+Known unavailable/private/removed clips are recorded and skipped on subsequent
+preparation attempts. Transient failures expire after an hour, and rate-limit
+failures after 15 minutes. `--retry-failures` explicitly retries recorded failures.
+Rate-limit responses pause subsequent attempts across workers, and retry counts
+are bounded. Format alternatives are resolved in one yt-dlp extraction attempt.
+
+New downloads are encoded directly as video-only H.264 MP4 clips (CRF 18),
+rather than stream-copied at potentially unsafe reference-frame boundaries.
+This adds CPU encoding work during preparation but avoids a separate cleanup
+pass for newly downloaded clips. Existing cached files are reused unchanged.
+Downloads are validated before being promoted to the cache. An invalid prior
+clip is preserved separately when a valid replacement succeeds. Avoid running
+multiple preparations against the same cache simultaneously.
+
+Negative captions are sampled only from other successfully prepared videos,
+excluding every known caption of the positive video. Sampling uses replacement
+to keep the number of negatives consistent, even for a small corpus. `--seed`
+controls this sampling; it does not seed model training. Source-order selection
+keeps results independent of download completion order, although availability
+can change the selected videos between preparation runs.
+
+Run the synthetic, offline regression tests with:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+### Clean a cache with H.264 decoder warnings
+
+Older stream-copied clips can emit missing-reference warnings even with sequential decoding.
+This one-time command checks the prepared clips and creates a separate cache,
+re-encoding only files with decoder diagnostics. Original videos are untouched.
+Re-encoded video is lossy (H.264 CRF 18); already undecodable image details
+cannot be recovered. The command verifies decoded frame counts and new decoder
+diagnostics before writing the new manifest.
+
+```bash
+./scripts/run-wsl-gpu.sh scripts/normalize_video_cache.py --data-dir data/msrvtt --output-dir data/msrvtt-clean
+./scripts/run-wsl-gpu.sh scripts/pipeline.py --dataset msrvtt --max-videos 1000 --cached-only --device cuda --data-dir data/msrvtt-clean
+```
+
+Choose a new output directory for each cleanup attempt. The original cache is
+never modified; the second command starts a fresh training run using the clean cache.
 
 ### 2. Search Phase
 Use the trained model for interactive or command-line search:
@@ -127,15 +236,15 @@ Edit `video_search/core/config.py` to adjust model parameters:
 
 ```python
 class VideoSearchConfig:
-    max_frames = 8              # Frames per video
-    frame_size = (224, 224)     # Frame resolution
-    text_embed_dim = 512        # Text embedding dimension
-    video_embed_dim = 512       # Video embedding dimension
-    temperature = 0.07          # Contrastive learning temperature
-    num_negatives = 7           # Negative samples per triplet
-    batch_size = 16             # Training batch size
-    learning_rate = 1e-4        # Adam learning rate
-    num_epochs = 10             # Training epochs
+    max_frames = 8  # Frames per video
+    frame_size = (224, 224)  # Frame resolution
+    text_embed_dim = 512  # Text embedding dimension
+    video_embed_dim = 512  # Video embedding dimension
+    temperature = 0.07  # Contrastive learning temperature
+    num_negatives = 7  # Negative samples per triplet
+    batch_size = 16  # Training batch size
+    learning_rate = 1e-4  # Adam learning rate
+    num_epochs = 10  # Training epochs
 ```
 
 ## Workflow
@@ -381,3 +490,64 @@ python scripts/search_cli.py "cooking" --format json --top-k 2
   ]
 }
 ```
+
+## Training checkpoints
+
+The pipeline saves model weights, Adam optimizer state, completed epochs, loss
+history, and Python/PyTorch random state after every completed epoch. Checkpoints
+are written to a temporary file and atomically replace the previous checkpoint.
+A crash during an epoch requires repeating that epoch. A machine or disk failure
+can still damage files; this is not a backup system.
+
+For a 100-video, five-epoch run using an existing prepared cache:
+
+```bash
+./scripts/run-wsl-gpu.sh scripts/pipeline.py \
+  --dataset msrvtt --max-videos 100 --cached-only --device cuda \
+  --epochs 5 --checkpoint checkpoints/msrvtt-100.pt
+```
+
+Resume with the same cache, video count, negative-sampling seed, and batch size:
+
+```bash
+./scripts/run-wsl-gpu.sh scripts/pipeline.py \
+  --dataset msrvtt --max-videos 100 --cached-only --device cuda \
+  --epochs 5 --resume checkpoints/msrvtt-100.pt
+```
+
+`--epochs 5` means five total epochs, including completed epochs. To extend the
+run, increase that total. `--batch-size` defaults to 16 and must stay the same
+when resuming. A dataset/settings mismatch is rejected. Device changes are
+allowed, but numerical results need not match across devices or environments.
+Only resume checkpoints you trust. Starting a fresh run refuses to overwrite an
+existing training checkpoint; choose another `--checkpoint` path instead.
+Final model and index outputs retain their existing paths under `models/`.
+
+## Native Windows AMD environment
+
+The optional `environments/amd/` uv project uses Python 3.12 and AMD's
+PyTorch 2.12.0 / torchvision 0.27.0 ROCm 7.14.1 builds for `gfx1100`.
+It is separate from the original requirements and WSL environments.
+
+From PowerShell in the project directory:
+
+```powershell
+uv sync --project environments/amd --locked --python 3.12
+.\gpu.ps1 scripts/pipeline.py --dataset msrvtt --max-videos 100 --cached-only --device cuda --epochs 5 --checkpoint checkpoints/windows-100.pt
+```
+
+To resume, use the same arguments with `--resume checkpoints/windows-100.pt`
+in place of `--checkpoint`. The launcher works regardless of another active
+virtual environment. It reads the optional ignored `.gpu-device` file to set
+`HIP_VISIBLE_DEVICES`; an explicitly set environment variable takes precedence.
+AMD GPUs use PyTorch's `cuda` device name.
+
+The copied prepared videos are available under `data/msrvtt`. Their manifest
+timestamps were refreshed for NTFS; video bytes and captions are unchanged.
+The first launch may download pretrained BERT and ResNet50 weights.
+
+On Windows AMD GPUs, BERT uses PyTorch's standard math attention backend to
+avoid a ROCm fused-attention regression that can cause later operations to fail
+with `hipErrorInvalidValue`. This changes the execution backend, not the model
+architecture or objective; it may use more memory or run slower than fused
+attention. See [the upstream report](https://github.com/ROCm/TheRock/issues/7992).

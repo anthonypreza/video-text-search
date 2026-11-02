@@ -1,19 +1,17 @@
-import torch
-from torch.utils.data import Dataset
-
+import json
 import os
-import glob
 import random
-import subprocess
-import sys
-import shutil
-import importlib.util
-from typing import List, Dict, Optional
-from tqdm import tqdm
+import re
+from pathlib import Path
+from typing import TypedDict, cast
 
-from transformers import AutoTokenizer
+import torch
 from datasets import load_dataset
+from torch.utils.data import Dataset
+from tqdm import tqdm
+from transformers import PreTrainedTokenizerBase
 
+from .downloads import atomic_json, prepare_clips
 from .video import VideoProcessor
 
 
@@ -21,13 +19,13 @@ class VideoQueryTriplet:
     """Data structure for training triplets: (video_path, positive_query, negative_queries)"""
 
     def __init__(
-        self, video_path: str, positive_query: str, negative_queries: List[str]
+        self, video_path: str, positive_query: str, negative_queries: list[str]
     ):
         self.video_path = video_path
         self.positive_query = positive_query
         self.negative_queries = negative_queries
 
-    def get_all_queries(self) -> List[str]:
+    def get_all_queries(self) -> list[str]:
         """Returns [positive_query, negative_query1, negative_query2, ...]"""
         return [self.positive_query] + self.negative_queries
 
@@ -36,14 +34,23 @@ class VideoQueryTriplet:
         return 0
 
 
-class VideoQueryDataset(Dataset):
+class VideoQuerySample(TypedDict):
+    video_frames: torch.Tensor
+    text_input_ids: torch.Tensor
+    text_attention_mask: torch.Tensor
+    target_index: torch.Tensor
+    video_path: str
+    queries: list[str]
+
+
+class VideoQueryDataset(Dataset[VideoQuerySample]):
     """Dataset class for loading and processing video-query triplets"""
 
     def __init__(
         self,
-        triplets: List[VideoQueryTriplet],
+        triplets: list[VideoQueryTriplet],
         video_processor: VideoProcessor,
-        tokenizer: AutoTokenizer,
+        tokenizer: PreTrainedTokenizerBase,
         max_text_length: int = 128,
     ):
         self.triplets = triplets
@@ -54,7 +61,7 @@ class VideoQueryDataset(Dataset):
     def __len__(self) -> int:
         return len(self.triplets)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> VideoQuerySample:
         triplet = self.triplets[idx]
 
         # Extract video frames
@@ -71,290 +78,199 @@ class VideoQueryDataset(Dataset):
             padding="max_length",
             max_length=self.max_text_length,
             return_tensors="pt",
-        )  # type: ignore
+        )
 
         return {
             "video_frames": video_frames,  # [num_frames, 3, H, W]
-            "text_input_ids": encoding["input_ids"],  # [num_texts, seq_len]
-            "text_attention_mask": encoding["attention_mask"],  # [num_texts, seq_len]
+            "text_input_ids": cast(
+                torch.Tensor, encoding["input_ids"]
+            ),  # [num_texts, seq_len]
+            "text_attention_mask": cast(
+                torch.Tensor, encoding["attention_mask"]
+            ),  # [num_texts, seq_len]
             "target_index": torch.tensor(target_index, dtype=torch.long),  # scalar
             "video_path": triplet.video_path,  # for debugging
             "queries": all_queries,  # for debugging
-        }  # type: ignore
+        }
 
 
-def download_youtube_clip(
-    youtube_url: str,
-    output_path: str,
-    start_time: float,
-    end_time: float,
-    verbose: bool = False
-) -> bool:
-    """Download a specific clip from a YouTube video using yt-dlp and ffmpeg
-
-    Tries multiple format options to maximize success rate
-
-    Args:
-        youtube_url: URL of the YouTube video
-        output_path: Path to save the downloaded clip
-        start_time: Start time in seconds
-        end_time: End time in seconds
-        verbose: If True, print detailed error messages for debugging
-    """
-    # Use the same environment as this Python process; a venv Python alone does
-    # not put its Scripts directory on PATH for subprocesses.
-    if importlib.util.find_spec("yt_dlp") is None:
-        raise RuntimeError("yt-dlp is not installed in the Python environment running this script.")
-    if shutil.which("ffmpeg") is None:
-        raise RuntimeError(
-            "FFmpeg executable was not found on PATH. Install FFmpeg, reopen the terminal, "
-            "and check `ffmpeg -version` before retrying. The Python ffmpeg package is not sufficient."
-        )
-
-    # Format options to try in order of preference
-    format_options = [
-        # best/worst require BOTH audio and video. The encoder only needs video,
-        # so accept separate video streams as well as combined streams.
-        # Prefer H.264: MP4 may also contain AV1, which some OpenCV builds cannot decode.
-        "bestvideo*[height<=480][ext=mp4][vcodec^=avc1]",
-        "bestvideo*[height<=480][ext=mp4]",
-        "bestvideo*[height<=480]",
-        "bestvideo*",
-    ]
-
-    last_error = None
-    for format_option in format_options:
-        try:
-            # Clean up any previous temporary files
-            for temp_file in glob.glob(output_path + ".temp.*"):
-                try:
-                    os.remove(temp_file)
-                except OSError:
-                    pass
-
-            # Create temporary file for full video
-            temp_video = output_path + ".temp.%(ext)s"
-            duration = end_time - start_time
-
-            # Download the specific segment using yt-dlp with ffmpeg
-            result = subprocess.run(
-                [
-                    sys.executable, "-m", "yt_dlp",
-                    "--external-downloader",
-                    "ffmpeg",
-                    "--external-downloader-args",
-                    f"ffmpeg_i:-ss {start_time} -t {duration}",
-                    "-o",
-                    temp_video,
-                    "--no-playlist",
-                    "--format",
-                    format_option,
-                    "--no-warnings",  # Reduce noise
-                    youtube_url,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=120,
+def _read_prepared_manifest(data_dir, manifest_path, max_videos):
+    manifest = Path(manifest_path)
+    if not manifest.is_file():
+        raise ValueError("Prepared manifest missing; run --prepare-only first")
+    content = json.loads(manifest.read_text())
+    if content.get("version") != 1:
+        raise ValueError("Unsupported prepared manifest version")
+    records = content["videos"]
+    if max_videos is not None:
+        if len(records) < max_videos:
+            raise ValueError(
+                f"Manifest has {len(records)} videos, requested {max_videos}; prepare more videos first"
             )
+        records = records[:max_videos]
+    for record in records:
+        video_id = str(record["video_id"])
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", video_id):
+            raise ValueError("Unsafe video ID in prepared manifest")
+        path = Path(data_dir) / "videos" / f"{video_id}.mp4"
+        if not path.is_file():
+            raise ValueError(
+                f"Prepared video missing: {video_id}; rerun --prepare-only"
+            )
+        stat = path.stat()
+        if stat.st_size != record["size"] or stat.st_mtime_ns != record["mtime_ns"]:
+            raise ValueError(
+                f"Prepared video changed: {video_id}; rerun --prepare-only to validate it"
+            )
+    return records
 
-            if result.returncode == 0:
-                # Find the downloaded file (yt-dlp adds extension)
-                temp_files = glob.glob(output_path + ".temp.*")
-                if temp_files:
-                    # Move to final location
-                    temp_file = temp_files[0]
-                    os.rename(temp_file, output_path)
 
-                    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                        return True
-            else:
-                # Store the error for verbose output
-                last_error = result.stderr
+def prepare_msrvtt_dataset(
+    data_dir="./data/msrvtt",
+    max_videos=None,
+    *,
+    download_workers=3,
+    retry_failures=False,
+    cached_only=False,
+    manifest_path=None,
+):
+    """Prepare decodable clips once; cached-only reads the resulting manifest offline."""
+    if max_videos is not None and max_videos < 1:
+        raise ValueError("max_videos must be positive")
+    manifest_path = (
+        Path(manifest_path) if manifest_path else Path(data_dir) / "prepared.json"
+    )
+    if cached_only:
+        return _read_prepared_manifest(data_dir, manifest_path, max_videos)
+    print("Loading MSR-VTT metadata...")
+    train_data = load_dataset("friedrichor/MSR-VTT", "train_7k")["train"]
+    grouped = {}
+    # Keep all candidates available: max_videos limits successful clips, not rows.
+    for item in tqdm(train_data, desc="Processing captions"):
+        video_id = str(item["video_id"])
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", video_id):
+            raise ValueError(f"Unsafe video ID: {video_id!r}")
+        captions = (
+            item["caption"] if isinstance(item["caption"], list) else [item["caption"]]
+        )
+        if video_id not in grouped:
+            start = float(item.get("start time") or 0)
+            end = float(item.get("end time") or start + 10)
+            grouped[video_id] = {
+                "video_id": video_id,
+                "url": item["url"],
+                "start_time": start,
+                "end_time": end,
+                "captions": [],
+            }
+        grouped[video_id]["captions"].extend(
+            c for c in captions if isinstance(c, str) and c.strip()
+        )
+    items = []
+    for record in grouped.values():
+        record["captions"] = list(dict.fromkeys(record["captions"]))
+        if record["captions"]:
+            items.append(record)
+    video_dir = Path(data_dir) / "videos"
+    video_dir.mkdir(parents=True, exist_ok=True)
+    selected = prepare_clips(
+        items,
+        max_videos or len(items),
+        video_dir,
+        Path(data_dir) / "download-failures",
+        download_workers,
+        retry_failures,
+    )
+    if not selected:
+        raise ValueError("No usable videos were prepared; check the download failures")
+    records = []
+    for item in selected:
+        stat = (video_dir / f"{item['video_id']}.mp4").stat()
+        records.append({**item, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+    atomic_json(manifest_path, {"version": 1, "videos": records})
+    print(f"Prepared manifest: {manifest_path}")
+    return records
 
-        except subprocess.TimeoutExpired:
-            last_error = "Timeout"
-            if verbose:
-                print(f"Timeout downloading {youtube_url} with format {format_option}")
-            continue
-        except Exception as e:
-            last_error = str(e)
-            if verbose:
-                print(f"Error with format {format_option}: {e}")
-            continue
 
-    # All formats failed
-    print(f"Failed to download {youtube_url} after trying all format options")
-    if last_error:
-        print(f"Last error: {last_error.strip()[-1200:]}")
-
-    # Clean up any temporary files
-    for temp_file in glob.glob(output_path + ".temp.*"):
-        try:
-            os.remove(temp_file)
-        except OSError:
-            pass
-
-    return False
+def build_msrvtt_triplets(records, data_dir, num_negatives=7, seed=42):
+    """Sample another usable video, then a caption; never use same-video positives."""
+    if num_negatives < 1:
+        raise ValueError("num_negatives must be positive")
+    if len(records) < 2:
+        raise ValueError(
+            "At least two usable videos are required for cross-video negatives"
+        )
+    rng = random.Random(seed)
+    triplets = []
+    for index, record in enumerate(tqdm(records, desc="Building triplets")):
+        positives = set(record["captions"])
+        fallback = None
+        for caption in record["captions"]:
+            negatives = []
+            attempts = 0
+            while len(negatives) < num_negatives and attempts < max(
+                100, num_negatives * 20
+            ):
+                other_index = rng.randrange(len(records) - 1)
+                if other_index >= index:
+                    other_index += 1
+                candidate = rng.choice(records[other_index]["captions"])
+                if candidate not in positives:
+                    negatives.append(candidate)
+                attempts += 1
+            if len(negatives) < num_negatives:
+                # Rare fallback for very repetitive data, computed once per video.
+                if fallback is None:
+                    fallback = [
+                        candidate
+                        for other in records
+                        if other["video_id"] != record["video_id"]
+                        for candidate in other["captions"]
+                        if candidate not in positives
+                    ]
+                if not fallback:
+                    raise ValueError(
+                        f"No distinct cross-video negative captions for {record['video_id']}"
+                    )
+                negatives.extend(
+                    rng.choices(fallback, k=num_negatives - len(negatives))
+                )
+            triplets.append(
+                VideoQueryTriplet(
+                    str(Path(data_dir) / "videos" / f"{record['video_id']}.mp4"),
+                    caption,
+                    negatives,
+                )
+            )
+    print(f"Created {len(triplets)} triplets from {len(records)} usable videos")
+    return triplets
 
 
 def load_msrvtt_dataset(
-    data_dir: str = "./data/msrvtt",
-    max_videos: Optional[int] = None,
-    num_negatives: int = 7,
-) -> List[VideoQueryTriplet]:
-    """Load MSR-VTT dataset and convert to VideoQueryTriplet format
-
-    Args:
-        data_dir: Directory to store downloaded videos
-        max_videos: Maximum number of videos to process (None for all)
-        num_negatives: Number of negative captions per video
-
-    Returns:
-        List of VideoQueryTriplet objects
-    """
-    print("Loading MSR-VTT dataset...")
-    dataset = load_dataset("friedrichor/MSR-VTT", "train_7k")
-
-    # Use train split
-    train_data = dataset["train"]
-    if max_videos:
-        train_data = train_data.select(range(min(max_videos, len(train_data))))  # type: ignore
-
-    # Create video directory
-    video_dir = os.path.join(data_dir, "videos")
-    os.makedirs(video_dir, exist_ok=True)
-
-    # Group captions by video_id and collect all captions
-    video_captions = {}
-    all_captions = []
-
-    for i, item in enumerate(tqdm(train_data, desc="Processing captions")):
-        video_id = item["video_id"]
-        caption = item["caption"]
-        video_url = item["url"]
-        start_time = item.get("start time", 0)  # Default to 0 if not available
-        end_time = item.get("end time", 10)  # Default to 10 seconds if not available
-
-        # Handle case where caption might be a list
-        if isinstance(caption, list):
-            captions_to_add = caption
-        else:
-            captions_to_add = [caption]
-
-        # Add to all captions for negative sampling
-        for cap in captions_to_add:
-            all_captions.append(cap)
-
-        if video_id not in video_captions:
-            video_captions[video_id] = {
-                "captions": [],
-                "url": video_url,
-                "start_time": start_time,
-                "end_time": end_time,
-            }
-
-        for cap in captions_to_add:
-            video_captions[video_id]["captions"].append(cap)
-
-    triplets = []
-    failed_downloads = 0
-    successful_videos = 0
-
-    # Convert to list for easier iteration with retry logic
-    video_items = list(video_captions.items())
-
-    # If max_videos is specified, keep trying until we get that many successful videos
-    target_videos = max_videos if max_videos else len(video_items)
-
-    pbar = tqdm(total=target_videos, desc="Creating triplets")
-
-    # Track skipped videos for summary
-    skipped_videos = 0
-
-    # Iterate through all available videos until we reach target or run out
-    for video_id, video_data in video_items:
-        # Check if we've reached the target
-        if successful_videos >= target_videos:
-            break
-
-        video_path = os.path.join(video_dir, f"{video_id}.mp4")
-
-        # Check if video already exists and has valid size
-        if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
-            # Video already downloaded, skip download
-            skipped_videos += 1
-            print(f"✓ Skipping {video_id} (already exists, {os.path.getsize(video_path) / 1024:.1f} KB)")
-        else:
-            # Download video clip
-            if not download_youtube_clip(
-                video_data["url"],
-                video_path,
-                video_data["start_time"],
-                video_data["end_time"],
-            ):
-                failed_downloads += 1
-                # Continue to try next video
-                continue
-
-        # Successfully have a video (either downloaded or already existed)
-        successful_videos += 1
-        pbar.update(1)
-
-        # For each caption, create a separate triplet
-        for caption in video_data["captions"]:
-            # Sample negative captions (from other videos, excluding this caption)
-            other_captions = [c for c in all_captions if c != caption]
-            negative_queries = random.sample(
-                other_captions, min(num_negatives, len(other_captions))
-            )
-
-            triplet = VideoQueryTriplet(
-                video_path=video_path,
-                positive_query=caption,  # Single caption, not a list
-                negative_queries=negative_queries,  # List of negative captions
-            )
-            triplets.append(triplet)
-
-    pbar.close()
-
-    # Calculate statistics
-    newly_downloaded = successful_videos - skipped_videos
-    total_attempted = successful_videos + failed_downloads
-    success_rate = (successful_videos / total_attempted * 100) if total_attempted > 0 else 0
-
-    print(f"\n{'='*60}")
-    print(f"Dataset Loading Summary:")
-    print(f"{'='*60}")
-    print(f"Successfully obtained: {successful_videos} videos")
-    print(f"  - Already cached: {skipped_videos} videos")
-    print(f"  - Newly downloaded: {newly_downloaded} videos")
-    print(f"Failed downloads: {failed_downloads} videos")
-    print(f"Total attempted: {total_attempted} videos")
-    print(f"Success rate: {success_rate:.1f}%")
-    print(f"Created {len(triplets)} training triplets")
-    print(f"{'='*60}\n")
-
-    if failed_downloads > 0:
-        print("ℹ️  Note: Video download failures are common with YouTube datasets.")
-        print("   Reasons include: deleted videos, geographic restrictions, age gates,")
-        print("   copyright takedowns, or removed channels.")
-        print("   The system will continue with successfully downloaded videos.\n")
-
-        # Provide recommendations based on success rate
-        if success_rate < 50:
-            print(f"⚠️  Warning: Low success rate ({success_rate:.1f}%).")
-            print("   Consider increasing --max-videos to ensure enough training data.")
-            print("   The dataset will automatically retry until target is reached.\n")
-        elif successful_videos < 50:
-            print("💡 Tip: For better model performance, consider downloading more videos.")
-            print("   Run with --max-videos 200 or higher to get more training data.\n")
-
-    return triplets
+    data_dir="./data/msrvtt",
+    max_videos=None,
+    num_negatives=7,
+    *,
+    download_workers=3,
+    retry_failures=False,
+    cached_only=False,
+    manifest_path=None,
+    seed=42,
+):
+    records = prepare_msrvtt_dataset(
+        data_dir,
+        max_videos,
+        download_workers=download_workers,
+        retry_failures=retry_failures,
+        cached_only=cached_only,
+        manifest_path=manifest_path,
+    )
+    return build_msrvtt_triplets(records, data_dir, num_negatives, seed)
 
 
 def create_synthetic_dataset(
     num_videos: int = 20, num_negatives: int = 7
-) -> List[VideoQueryTriplet]:
+) -> list[VideoQueryTriplet]:
     """Create a synthetic dataset for testing"""
 
     # Create some dummy videos

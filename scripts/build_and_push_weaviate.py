@@ -12,19 +12,19 @@ Usage examples:
   python scripts/build_and_push_weaviate.py --dataset synthetic --normalize
 """
 
-import os
-import sys
-import json
-import uuid
-import time
-import pickle
 import argparse
+import os
+import pickle
+import sys
+import time
+import uuid
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import TypedDict
 
 import numpy as np
 import requests
 import torch
+from numpy.typing import NDArray
 
 # --- Ensure project root on sys.path ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -42,7 +42,7 @@ from video_search.search.index import build_video_index
 # -----------------------
 # Utilities
 # -----------------------
-def l2_normalize(x: np.ndarray) -> np.ndarray:
+def l2_normalize(x: NDArray[np.float32]) -> NDArray[np.float32]:
     n = np.linalg.norm(x, axis=1, keepdims=True) + 1e-12
     return x / n
 
@@ -73,7 +73,7 @@ def ensure_schema(
     distance: str = "cosine",
     ef_construction: int = 128,
     max_connections: int = 16,
-    api_key: Optional[str] = None,
+    api_key: str | None = None,
 ) -> None:
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -126,7 +126,18 @@ def ensure_schema(
     print("✅ Schema created.")
 
 
-def path_to_properties(path: str, channel: str) -> Dict:
+class ClipProperties(TypedDict):
+    video_id: str
+    start_s: float
+    end_s: float
+    title: str
+    channel: str
+    url: str
+    caption: str
+    tags: list[str]
+
+
+def path_to_properties(path: str, channel: str) -> ClipProperties:
     base = os.path.basename(path)
     video_id = os.path.splitext(base)[0]
     return {
@@ -144,10 +155,10 @@ def path_to_properties(path: str, channel: str) -> Dict:
 def batch_upsert(
     weaviate_url: str,
     class_name: str,
-    vectors: np.ndarray,
-    paths: List[str],
+    vectors: NDArray[np.float32],
+    paths: list[str],
     channel: str,
-    api_key: Optional[str] = None,
+    api_key: str | None = None,
     batch_size: int = 256,
     timeout: int = 120,
 ) -> None:

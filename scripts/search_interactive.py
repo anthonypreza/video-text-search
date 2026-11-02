@@ -5,13 +5,12 @@ Interactive Video Search Interface
 Load a trained model and video index to perform interactive video search queries.
 """
 
+import argparse
 import os
 import pickle
-import torch
-import argparse
-from typing import List, Tuple
-
 import sys
+
+import torch
 
 # Ensure the project root (containing the `video_search` package) is on sys.path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -19,14 +18,15 @@ PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from video_search.core.config import VideoSearchConfig  # noqa: E402
-from video_search.core.model import VideoTextContrastiveModel  # noqa: E402
-from video_search.search.search import search_videos_indexed  # noqa: E402
+from video_search.core.config import VideoSearchConfig
+from video_search.core.model import VideoTextContrastiveModel
+from video_search.search.index import VideoIndex
+from video_search.search.search import search_videos_indexed
 
 
 def load_model_and_index(
     config: VideoSearchConfig,
-) -> Tuple[VideoTextContrastiveModel, dict, List[str]]:
+) -> tuple[VideoTextContrastiveModel, VideoIndex, list[str]]:
     """Load trained model, video index, and video paths from saved files"""
 
     # Check if files exist
@@ -77,8 +77,8 @@ def load_model_and_index(
 
 def interactive_search(
     model: VideoTextContrastiveModel,
-    video_index: dict,
-    video_paths: List[str],
+    video_index: VideoIndex,
+    video_paths: list[str],
     top_k: int = 5,
 ):
     """Run interactive search loop"""
@@ -115,9 +115,7 @@ def interactive_search(
                 print(
                     "  • Index type: Pre-computed embedding cache with dot product similarity"
                 )
-                print(
-                    f"  • Model device: {model.video_encoder.resnet.conv1.weight.device}"  # type: ignore
-                )
+                print(f"  • Model device: {next(model.parameters()).device}")
                 print(
                     f"  • Embedding dimension: {model.video_encoder.projection.out_features}"
                 )

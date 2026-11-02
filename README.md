@@ -17,6 +17,7 @@ Text Query → BERT → Text Encoder (512-dim)
 ```
 
 **Key Components:**
+
 - **Video Encoder**: ResNet50 backbone + temporal aggregation + projection to 512-dim embeddings
 - **Text Encoder**: BERT + projection layer with L2 normalization
 - **Contrastive Learning**: Temperature-scaled cosine similarity with cross-entropy loss
@@ -33,17 +34,22 @@ Text Query → BERT → Text Encoder (512-dim)
 ## Dataset Options
 
 ### MSR-VTT (Recommended)
+
 - **Source**: Microsoft Research Video to Text dataset
 - **Content**: ~7,000 YouTube video clips with multiple captions each
 - **Download**: Automatic downloading of video segments with precise start/end times
 - **Captions**: ~20 human-annotated captions per video clip
 
 ### Synthetic (Testing)
+
 - **Categories**: Cats, dogs, cooking, sports
 - **Content**: Generated dummy videos with associated text descriptions
 - **Use Case**: Quick testing without video downloads
 
 ## Quick Start
+
+Examples use a Unix shell and `python` from the activated environment. Optional
+GPU environments are described at the end; the pipeline arguments stay the same.
 
 ### 0. Install Python dependencies
 
@@ -56,7 +62,6 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-On Windows PowerShell, activate with `.\.venv\Scripts\Activate.ps1` instead.
 Install the system FFmpeg executable as described below and check `ffmpeg -version`.
 The dependency file pins direct Python dependencies; it is not a complete lockfile.
 PyTorch GPU support depends on your platform and driver setup; CPU execution is supported.
@@ -72,32 +77,8 @@ python -m pip install --upgrade "yt-dlp[default]"
 For full YouTube support, yt-dlp also recommends a supported JavaScript runtime;
 see its [runtime setup guide](https://github.com/yt-dlp/yt-dlp/wiki/EJS).
 
-### AMD GPU training on WSL
-
-For Ubuntu 24.04, Python 3.12, and an installed ROCm 6.4.2 WSL runtime:
-
-```bash
-./scripts/setup-wsl-gpu.sh
-./scripts/run-wsl-gpu.sh -c 'import torch; print(torch.cuda.get_device_name(0))'
-./scripts/run-wsl-gpu.sh scripts/pipeline.py --dataset msrvtt --max-videos 1000
-```
-
-This uses an isolated `.venv-wsl-gpu` environment with AMD's matching PyTorch
-and Torchvision wheels. PyTorch uses the `cuda` device name for AMD HIP too.
-The launcher sets the WSL runtime library paths. The environment supports both CPU and GPU execution.
-The setup preserves the wheel's bundled HSA libraries inside the environment
-and uses the system's WSL-compatible HSA runtime instead, following
-[AMD's ROCm 6.4.2 WSL instructions](https://rocm.docs.amd.com/projects/radeon-ryzen/en/docs-6.4.2/docs/install/wsl/install-pytorch.html).
-
-Do not install the default `requirements.txt` into this GPU environment: it
-selects a different PyTorch build and NumPy version. Existing environments are
-unaffected. The pipeline still uses the parameters in `video_search/core/config.py`
-and writes its model and index to the configured paths. Back up prior outputs
-before rerunning if you want to retain them. Download failures can reduce the
-number of usable videos below the requested maximum. Evaluation remains the
-training-data sanity check described below.
-
 ### 1. Training Phase
+
 Train the model and create the search index (run from video-text-search/ directory):
 
 ```bash
@@ -109,6 +90,7 @@ python scripts/pipeline.py --dataset synthetic
 ```
 
 This creates:
+
 - `./models/video_search_model.pth` - Trained model
 - `./models/video_index.pkl` - Pre-computed video embeddings cache
 - `./models/video_paths.txt` - Video file paths
@@ -118,11 +100,11 @@ This creates:
 Use `--device auto` (the default), `--device cuda`, or `--device cpu`.
 `auto` selects an available GPU, otherwise CPU. `cuda` also names AMD HIP
 devices and raises an error if no GPU is available; it does not silently fall
-back to CPU. The same WSL ROCm environment runs either mode:
+back to CPU. With a compatible GPU-enabled PyTorch environment:
 
 ```bash
-./scripts/run-wsl-gpu.sh scripts/pipeline.py --dataset msrvtt --max-videos 1000 --cached-only --device cuda
-./scripts/run-wsl-gpu.sh scripts/pipeline.py --dataset msrvtt --max-videos 1000 --cached-only --device cpu
+python scripts/pipeline.py --dataset msrvtt --max-videos 1000 --cached-only --device cuda
+python scripts/pipeline.py --dataset msrvtt --max-videos 1000 --cached-only --device cpu
 ```
 
 Frame extraction decodes sequentially and samples across the actual frame
@@ -139,13 +121,12 @@ maximum counts successful videos; unavailable source clips are skipped.
 
 ```bash
 # CPU preparation; no model weights are loaded.
-.venv-wsl-gpu/bin/python scripts/pipeline.py --dataset msrvtt --max-videos 1000 --prepare-only --download-workers 3
+python scripts/pipeline.py --dataset msrvtt --max-videos 1000 --prepare-only --download-workers 3
 
 # Train from that manifest without metadata or video download requests.
-./scripts/run-wsl-gpu.sh scripts/pipeline.py --dataset msrvtt --max-videos 1000 --cached-only
+python scripts/pipeline.py --dataset msrvtt --max-videos 1000 --cached-only
 ```
 
-For another environment, replace `.venv-wsl-gpu/bin/python` with its Python.
 FFmpeg must be on PATH for preparation. The default one-command training flow
 still prepares clips automatically. Use `--data-dir` to choose the cache and
 `--prepared-manifest` to name a particular manifest. Cached-only mode checks
@@ -190,14 +171,15 @@ cannot be recovered. The command verifies decoded frame counts and new decoder
 diagnostics before writing the new manifest.
 
 ```bash
-./scripts/run-wsl-gpu.sh scripts/normalize_video_cache.py --data-dir data/msrvtt --output-dir data/msrvtt-clean
-./scripts/run-wsl-gpu.sh scripts/pipeline.py --dataset msrvtt --max-videos 1000 --cached-only --device cuda --data-dir data/msrvtt-clean
+python scripts/normalize_video_cache.py --data-dir data/msrvtt --output-dir data/msrvtt-clean
+python scripts/pipeline.py --dataset msrvtt --max-videos 1000 --cached-only --device cuda --data-dir data/msrvtt-clean
 ```
 
 Choose a new output directory for each cleanup attempt. The original cache is
 never modified; the second command starts a fresh training run using the clean cache.
 
 ### 2. Search Phase
+
 Use the trained model for interactive or command-line search:
 
 ```bash
@@ -212,6 +194,7 @@ python scripts/search_cli.py "cooking pasta" --format json --top-k 3
 ```
 
 ### 3. (Optional) Serve as a Weaviate-backed API
+
 If you want to expose the model through the Rust HTTP API and Weaviate, follow the
 deployment guide in [Deploying the Docker API](#deploying-the-docker-api).
 
@@ -222,6 +205,7 @@ deployment guide in [Deploying the Docker API](#deploying-the-docker-api).
 - **yt-dlp**: For downloading YouTube video clips (installed via pip)
 
 ### Install System Dependencies
+
 ```bash
 # Ubuntu/Debian
 sudo apt install ffmpeg
@@ -250,25 +234,26 @@ class VideoSearchConfig:
 ## Workflow
 
 ### Training Process
+
 1. **Data Loading**: Downloads video clips from YouTube with precise timing
-2. **Triplet Creation**: Each video caption becomes a positive query with N negative samples  
+2. **Triplet Creation**: Each video caption becomes a positive query with N negative samples
 3. **Contrastive Training**: Learns to maximize similarity between videos and their captions
 4. **Model & Index Saving**: Automatically saves trained model and search index
-5. **Evaluation**: Runs a small training-data ranking check, described below
+5. **Evaluation**: Reports held-out text-to-video Recall@K after MSR-VTT training
 
 ### Evaluation scope
 
-After training, the pipeline evaluates the first five training triplets. For each
-video, it ranks that triplet's positive caption against its sampled negative
-captions and reports `accuracy_at_1` and `accuracy_at_3`.
+MSR-VTT training holds out source videos before creating training triplets and
+reports final text-to-video Recall@1, @5, and @10. See **Held-out text-to-video
+evaluation** below for the split, candidate-pool size, and limitations.
 
-This is a training-data sanity check, not validation or held-out test evaluation.
-It does not measure text-to-video Recall@K across a video collection and should
-not be interpreted as a benchmark of retrieval generalization. The repository
-does not currently provide a held-out evaluation pipeline or verified benchmark
-results.
+Synthetic runs and `--test-fraction 0` retain the original first-five-triplet
+ranking sanity check (`accuracy_at_1` and `accuracy_at_3`), which is explicitly
+labeled as training-data evaluation. Neither mode claims verified benchmark
+results or an official MSR-VTT evaluation protocol.
 
 ### Search Process
+
 1. **Model Loading**: Loads pre-trained model and video index
 2. **Query Processing**: Encodes search query using BERT text encoder
 3. **Similarity Search**: Uses pre-computed embeddings with dot product similarity
@@ -303,12 +288,14 @@ The interactive search provides a rich user experience:
 ## Project Structure
 
 ### Scripts
+
 - `scripts/pipeline.py` - Training pipeline that saves model and index
 - `scripts/search_interactive.py` - Interactive search interface with rich UI
 - `scripts/search_cli.py` - Command-line search for single queries and scripting
 - `scripts/build_index.py` - Build an index from an already trained model
 
 ### Package: `video_search`
+
 - `video_search/core/config.py` - Configuration and save paths
 - `video_search/core/model.py` - Contrastive learning model and training/eval
 - `video_search/core/encoders.py` - Video and text encoder architectures
@@ -328,16 +315,19 @@ The interactive search provides a rich user experience:
 ## Command Line Options
 
 ### Training (`scripts/pipeline.py`)
+
 ```bash
 python scripts/pipeline.py --dataset [synthetic|msrvtt] --max-videos N
 ```
 
-### Interactive Search (`scripts/search_interactive.py`) 
+### Interactive Search (`scripts/search_interactive.py`)
+
 ```bash
 python scripts/search_interactive.py [--top-k N] [--model-path PATH] [--index-path PATH]
 ```
 
 ### CLI Search (`scripts/search_cli.py`)
+
 ```bash
 python scripts/search_cli.py "query" [--top-k N] [--format table|json|simple] [--quiet]
 ```
@@ -348,11 +338,13 @@ These steps take you from a trained checkpoint to a Weaviate-backed HTTP API tha
 serves semantic search results from the `api/` crate.
 
 ### 0. Preconditions
+
 - You have already run the training pipeline at least once.
 - The `models/` directory contains `video_search_model.pth` and the pre-built
   `video_index.pkl` produced by the pipeline.
 
 ### 1. Export the text tower to ONNX (and tokenizer)
+
 Re-run the pipeline with export flags so the API can load the text encoder via
 ONNX Runtime. The command below trains if needed, builds the index, exports the
 tokenizer, and writes the ONNX file under `models/`:
@@ -369,11 +361,13 @@ python scripts/pipeline.py \
 ```
 
 Tips:
+
 - Drop `--skip-training` if you want to fine-tune before exporting.
 - The ONNX export uses opset 17. You can request `--export-onnx-text`
   even if you already have a model – the command regenerates `models/text_encoder.onnx`.
 
 ### 2. Push fresh embeddings to Weaviate
+
 Weaviate needs the latest vectors for the clips you want to serve. Use the helper
 script to (re)create the `VideoClip` class and batch upsert the embeddings:
 
@@ -386,6 +380,7 @@ python scripts/build_and_push_weaviate.py \
 ```
 
 Notes:
+
 - Omit `--skip-build` unless you intentionally want to reuse the cached
   `video_index.pkl`. Reusing it repeatedly will duplicate objects in Weaviate.
 - The script auto-creates the `VideoClip` schema if it is missing.
@@ -405,6 +400,7 @@ docker compose up -d
 ```
 
 Key details:
+
 - Weaviate listens on `http://localhost:8080`; the API runs on `http://localhost:8088`.
 - The compose file mounts `./models` read-only, so the container picks up
   `text_encoder.onnx` and `tokenizer.json` automatically.
@@ -427,6 +423,7 @@ curl -s -X POST http://localhost:8088/v1/query/text \
 ```
 
 Example output:
+
 ```json
 {
   "results": [
@@ -469,6 +466,7 @@ weights or a fresh ONNX export.
 ## Example Output
 
 ### Interactive Search
+
 ```
 🔍 Search query: cat playing
 
@@ -480,8 +478,12 @@ weights or a fresh ONNX export.
 ```
 
 ### CLI JSON Output
+
 ```bash
 python scripts/search_cli.py "cooking" --format json --top-k 2
+```
+
+```json
 {
   "query": "cooking",
   "results": [
@@ -502,15 +504,15 @@ can still damage files; this is not a backup system.
 For a 100-video, five-epoch run using an existing prepared cache:
 
 ```bash
-./scripts/run-wsl-gpu.sh scripts/pipeline.py \
+python scripts/pipeline.py \
   --dataset msrvtt --max-videos 100 --cached-only --device cuda \
   --epochs 5 --checkpoint checkpoints/msrvtt-100.pt
 ```
 
-Resume with the same cache, video count, negative-sampling seed, and batch size:
+Resume with the same cache, video count, test fraction, seed, and batch size:
 
 ```bash
-./scripts/run-wsl-gpu.sh scripts/pipeline.py \
+python scripts/pipeline.py \
   --dataset msrvtt --max-videos 100 --cached-only --device cuda \
   --epochs 5 --resume checkpoints/msrvtt-100.pt
 ```
@@ -523,31 +525,93 @@ Only resume checkpoints you trust. Starting a fresh run refuses to overwrite an
 existing training checkpoint; choose another `--checkpoint` path instead.
 Final model and index outputs retain their existing paths under `models/`.
 
-## Native Windows AMD environment
+## Held-out text-to-video evaluation
 
-The optional `environments/amd/` uv project uses Python 3.12 and AMD's
-PyTorch 2.12.0 / torchvision 0.27.0 ROCm 7.14.1 builds for `gfx1100`.
-It is separate from the original requirements and WSL environments.
+MSR-VTT training holds out 10% of source videos by default. All clips sharing
+the same source URL stay together, and all captions stay with their clip. The
+split uses `--seed` (default 42); training negatives are sampled only from the
+training partition. Files stay in the existing cache. `--max-videos` counts the
+total selected clips before splitting; a 100-clip selection is usually about
+90 training / 10 test clips, depending on source grouping.
 
-From PowerShell in the project directory:
+After the final epoch, each held-out caption ranks every held-out video by
+embedding similarity. The pipeline reports Recall@1, @5, and @10, the number of
+caption queries, and the number of candidate videos. Recall is the fraction of
+queries whose annotated matching clip is in the top K. Every test caption is
+used; evaluation does not sample negative candidates. With ten candidates,
+Recall@10 is automatically 1.0, so compare results using the same candidate pool.
+The model export records the selected training/test video filenames and seed.
+
+Start a fresh run to get an unseen test set:
+
+```bash
+python scripts/pipeline.py \
+  --dataset msrvtt --max-videos 100 --cached-only --device auto \
+  --batch-size 4 --epochs 5 --test-fraction 0.1 \
+  --checkpoint checkpoints/msrvtt-100-heldout.pt
+```
+
+Resume using the same arguments with `--resume` instead of `--checkpoint`.
+Old checkpoints trained on all selected clips cannot produce a valid held-out
+test on that selection; the changed training-data signature prevents resuming
+them into the new split. `--test-fraction 0` preserves the previous all-data
+training behavior and its explicitly labeled training-sample sanity check.
+`--skip-training` only rebuilds the search index; it does not run the held-out test.
+
+This is an initial train/test experiment, not an official MSR-VTT benchmark split.
+There is no validation set or checkpoint selection by test performance. Run the
+test after training and avoid tuning repeatedly against it; add a validation
+split when comparing training choices. Exact source URLs are grouped, but this
+does not detect duplicate content under different URLs.
+
+## Optional AMD GPU environment on WSL
+
+For Ubuntu 24.04, Python 3.12, and an installed ROCm 6.4.2 WSL runtime:
+
+```bash
+./scripts/setup-wsl-gpu.sh
+./scripts/run-wsl-gpu.sh -c 'import torch; print(torch.cuda.get_device_name(0))'
+./scripts/run-wsl-gpu.sh scripts/pipeline.py --help
+```
+
+This uses an isolated `.venv-wsl-gpu` environment with AMD's matching PyTorch
+and Torchvision wheels. PyTorch uses the `cuda` device name for AMD HIP too.
+The launcher sets the WSL runtime library paths. The environment supports both CPU and GPU execution.
+The setup preserves the wheel's bundled HSA libraries inside the environment
+and uses the system's WSL-compatible HSA runtime instead, following
+[AMD's ROCm 6.4.2 WSL instructions](https://rocm.docs.amd.com/projects/radeon-ryzen/en/docs-6.4.2/docs/install/wsl/install-pytorch.html).
+
+Do not install the default `requirements.txt` into this GPU environment: it
+selects a different PyTorch build and NumPy version. Existing environments are
+unaffected. The pipeline still uses the parameters in `video_search/core/config.py`
+and writes its model and index to the configured paths. Back up prior outputs
+before rerunning if you want to retain them. Download failures can reduce the
+number of usable videos below the requested maximum. MSR-VTT training now uses
+a held-out video split and final text-to-video evaluation, described above.
+
+For the commands above, replace `python` with `./scripts/run-wsl-gpu.sh`.
+Use `--device cuda` for GPU execution or `--device cpu` for CPU execution.
+
+## Optional native Windows AMD environment
+
+The separate `environments/amd/` uv project targets Windows x86-64, Python 3.12,
+and AMD `gfx1100` GPUs with compatible drivers. It uses AMD's PyTorch 2.12.0 and
+torchvision 0.27.0 ROCm 7.14.1 builds; do not install `requirements.txt` into it.
+
+Only this optional setup uses PowerShell. From the project directory:
 
 ```powershell
 uv sync --project environments/amd --locked --python 3.12
-.\gpu.ps1 scripts/pipeline.py --dataset msrvtt --max-videos 100 --cached-only --device cuda --epochs 5 --checkpoint checkpoints/windows-100.pt
+.\gpu.ps1 scripts/pipeline.py --help
 ```
 
-To resume, use the same arguments with `--resume checkpoints/windows-100.pt`
-in place of `--checkpoint`. The launcher works regardless of another active
-virtual environment. It reads the optional ignored `.gpu-device` file to set
-`HIP_VISIBLE_DEVICES`; an explicitly set environment variable takes precedence.
-AMD GPUs use PyTorch's `cuda` device name.
+For any Python command above, replace `python` with `.\gpu.ps1` and keep the
+same arguments. Enter multiline Unix examples as a single line in PowerShell.
+Use `--device cuda` for the AMD GPU or `--device cpu` for CPU.
+The launcher selects its own environment, so no activation is required.
+`HIP_VISIBLE_DEVICES` can select a GPU when the system has multiple devices.
 
-The copied prepared videos are available under `data/msrvtt`. Their manifest
-timestamps were refreshed for NTFS; video bytes and captions are unchanged.
-The first launch may download pretrained BERT and ResNet50 weights.
-
-On Windows AMD GPUs, BERT uses PyTorch's standard math attention backend to
-avoid a ROCm fused-attention regression that can cause later operations to fail
-with `hipErrorInvalidValue`. This changes the execution backend, not the model
-architecture or objective; it may use more memory or run slower than fused
-attention. See [the upstream report](https://github.com/ROCm/TheRock/issues/7992).
+BERT uses the standard math attention backend on Windows AMD GPUs to avoid a
+[ROCm fused-attention issue](https://github.com/ROCm/TheRock/issues/7992).
+The model architecture and training objective are unchanged; this backend can
+use more memory or run slower than fused attention.

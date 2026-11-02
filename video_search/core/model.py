@@ -398,3 +398,43 @@ def evaluate_retrieval(
     }
 
     return metrics
+
+
+@torch.no_grad()
+def evaluate_text_to_video(
+    model: VideoTextContrastiveModel,
+    test_triplets: list[VideoQueryTriplet],
+    device: str = "cpu",
+    batch_size: int = 16,
+) -> dict[str, float | int]:
+    """Rank every held-out video for each annotated held-out caption."""
+    if not test_triplets or batch_size < 1:
+        raise ValueError("Evaluation requires test captions and a positive batch size")
+    model.to(device)
+    model.eval()
+    paths = list(dict.fromkeys(triplet.video_path for triplet in test_triplets))
+    indices = {path: index for index, path in enumerate(paths)}
+    videos = torch.stack(
+        [model.encode_video(path) for path in tqdm(paths, desc="Encoding test videos")]
+    )
+    hits = {1: 0, 5: 0, 10: 0}
+    for start in tqdm(
+        range(0, len(test_triplets), batch_size), desc="Testing caption retrieval"
+    ):
+        batch = test_triplets[start : start + batch_size]
+        queries = model.encode_texts([item.positive_query for item in batch])
+        scores = queries @ videos.T
+        # Stable sorting gives deterministic ordering for exactly tied scores.
+        rankings = scores.argsort(dim=1, descending=True, stable=True)
+        targets = torch.tensor(
+            [indices[item.video_path] for item in batch], device=rankings.device
+        )
+        for k in hits:
+            hits[k] += int(
+                (rankings[:, :k] == targets[:, None]).any(dim=1).sum().item()
+            )
+    return {
+        **{f"recall_at_{k}": count / len(test_triplets) for k, count in hits.items()},
+        "total_queries": len(test_triplets),
+        "candidate_videos": len(paths),
+    }

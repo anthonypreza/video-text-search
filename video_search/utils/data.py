@@ -192,6 +192,30 @@ def prepare_msrvtt_dataset(
     return records
 
 
+def split_video_records(records, test_fraction=0.1, seed=42):
+    """Hold out source videos before sampling captions or training negatives."""
+    if not 0 < test_fraction < 1:
+        raise ValueError("test_fraction must be between 0 and 1")
+
+    # Keep clips from the same YouTube URL together as well as their captions.
+    def source_id(record):
+        return str(record.get("url") or record["video_id"])
+
+    sources = sorted({source_id(record) for record in records})
+    if len(sources) < 2:
+        raise ValueError("A held-out split requires at least two source videos")
+    random.Random(seed).shuffle(sources)
+    count = min(len(sources) - 1, max(1, round(len(sources) * test_fraction)))
+    test_sources = set(sources[:count])
+    train = [record for record in records if source_id(record) not in test_sources]
+    test = [record for record in records if source_id(record) in test_sources]
+    if len(train) < 2:
+        raise ValueError(
+            "The split must leave at least two training clips for negatives"
+        )
+    return train, test
+
+
 def build_msrvtt_triplets(records, data_dir, num_negatives=7, seed=42):
     """Sample another usable video, then a caption; never use same-video positives."""
     if num_negatives < 1:
